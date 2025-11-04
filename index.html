@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TrueCostChecker</title>
+  <meta name="description" content="Compare grocery unit prices across sizes and packs to find the best deal fast." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-white text-gray-900">
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+
+/**
+ * TrueCostChecker – Unit Price Comparator
+ * ---------------------------------------------------------
+ * - Mobile-first, accessible UI
+ * - Compare by unit price with automatic unit conversions
+ * - Mass units: g, kg, oz, lb  (normalized to kg for display)
+ * - Volume units: mL, L, floz (normalized to L for display)
+ * - Highlights best value, shows savings vs next option
+ * - Modular layout so future tools can be added as tabs
+ *
+ * Styling: Tailwind (auto-included by canvas)
+ */
+
+const UNITS = {
+  // Mass → base: gram (g)
+  g: { label: "g", toBase: (v) => v, kind: "mass" },
+  kg: { label: "kg", toBase: (v) => v * 1000, kind: "mass" },
+  oz: { label: "oz", toBase: (v) => v * 28.349523125, kind: "mass" },
+  lb: { label: "lb", toBase: (v) => v * 453.59237, kind: "mass" },
+
+  // Volume → base: milliliter (mL)
+  mL: { label: "mL", toBase: (v) => v, kind: "volume" },
+  L: { label: "L", toBase: (v) => v * 1000, kind: "volume" },
+  floz: { label: "fl oz", toBase: (v) => v * 29.5735295625, kind: "volume" }, // US liquid fl oz
+};
+
+const BASE_DISPLAY = {
+  mass: { base: "g", show: "kg", factorToShow: 1 / 1000, suffix: "/kg" },
+  volume: { base: "mL", show: "L", factorToShow: 1 / 1000, suffix: "/L" },
+};
+
+const DEFAULT_ITEMS = [
+  { id: 1, name: "Almond Milk – Store A", qty: 1, size: 1.89, unit: "L", price: 4.49 },
+  { id: 2, name: "Almond Milk – Costco (6×946 mL)", qty: 6, size: 946, unit: "mL", price: "" },
+];
+
+function classNames(...c) {
+  return c.filter(Boolean).join(" ");
+}
+
+function useIdCounter(start = 3) {
+  const [counter, setCounter] = useState(start);
+  return [counter, () => setCounter((c) => c + 1)];
+}
+
+function currency(value, locale = undefined, currency = "USD") {
+  // Locale left undefined so browser default applies; currency symbol via Intl if desired.
+  try {
+    return new Intl.NumberFormat(locale, {
+      style: "currency",
+      currency,
+      maximumFractionDigits: 2,
+    }).format(value);
+  } catch (e) {
+    return `$${value.toFixed(2)}`;
+  }
+}
+
+function formatPerUnit(value) {
+  return value.toFixed(2);
+}
+
+/** AdSense placeholder components — paste your AdSense code where noted. */
+function AdSlot({ id, label }) {
+  return (
+    <div
+      className="ad-slot w-full min-h-[90px] border border-dashed border-gray-300 rounded-xl flex items-center justify-center text-xs text-gray-500 bg-gray-50"
+      data-ad-id={id}
+    >
+      {/* TODO: Replace this container with your AdSense code. Example:
+      <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXXXXXXXXXX" crossOrigin="anonymous"><\/script>
+      <ins class="adsbygoogle"
+           style="display:block"
+           data-ad-client="ca-pub-XXXXXXXXXXXX"
+           data-ad-slot="YYYYYYYYYY"
+           data-ad-format="auto"
+           data-full-width-responsive="true"></ins>
+      <script>(adsbygoogle = window.adsbygoogle || []).push({});<\/script>
+      */}
+      <span>Ad placeholder – {label}</span>
+    </div>
+  );
+}
+
+function AdSmartBlock() {
+  return (
+    <div className="mt-4">
+      {/* Mobile top ad below hero; on desktop it simply becomes an inline block */}
+      <AdSlot id="top-inline" label="Top Inline" />
+    </div>
+  );
+}
+function App() {
+  const [items, setItems] = useState(DEFAULT_ITEMS);
+  const [activeKind, setActiveKind] = useState("mass"); // mass | volume (for the Add form defaults)
+  const [sortMode, setSortMode] = useState('none');
+  const [idSeq, bump] = useIdCounter();
+
+  // Derive comparisons with conversions
+  const computed = useMemo(() => {
+    if (items.length === 0) return [];
+
+    // Build enriched rows with unit conversions and pack quantity
+    const enriched = items.map((it) => {
+      const meta = UNITS[it.unit];
+      if (!meta) return { ...it, error: "Unknown unit" };
+      const qty = Number(it.qty) || 1;
+      const baseQty = meta.toBase(Number(it.size) || 0) * qty; // total in base units (g or mL)
+      const perBase = baseQty > 0 ? (Number(it.price) || 0) / baseQty : Infinity; // $ per g or mL
+      const displayCfg = BASE_DISPLAY[meta.kind];
+      const perDisplay = perBase / displayCfg.factorToShow; // convert to $/kg or $/L
+      return {
+        ...it,
+        kind: meta.kind,
+        perBase,
+        perDisplay,
+      };
+    });
+
+    // Determine the best (lowest perDisplay) among comparable kinds only
+    const firstKind = enriched[0]?.kind;
+    const candidates = enriched.filter((e) => e.kind === firstKind && isFinite(e.perDisplay));
+    const best = candidates.length
+      ? candidates.reduce((min, x) => (x.perDisplay < min.perDisplay ? x : min), candidates[0])
+      : null;
+
+    // Add flags and savings percentage vs best
+    return enriched.map((e) => {
+      let savingsPct = null;
+      if (best && isFinite(e.perDisplay) && e.kind === best.kind) {
+        savingsPct = ((e.perDisplay - best.perDisplay) / e.perDisplay) * 100; // positive => % saved if switching to best
+      }
+      return { ...e, isBest: !!best && e.id === best.id, savingsPct };
+    });
+  }, [items]);
+
+  const commonKind = computed[0]?.kind;
+  const displayCfg = commonKind ? BASE_DISPLAY[commonKind] : BASE_DISPLAY[activeKind];
+
+  const sorted = useMemo(() => {
+    if (sortMode === 'asc') {
+      return [...computed].sort((a,b)=>a.perDisplay - b.perDisplay);
+    }
+    if (sortMode === 'desc') {
+      return [...computed].sort((a,b)=>b.perDisplay - a.perDisplay);
+    }
+    return computed; // preserve input order when not sorting
+  }, [computed, sortMode]);
+
+  function updateItem(id, patch) {
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  }
+
+  function removeItem(id) {
+    setItems((prev) => prev.filter((it) => it.id !== id));
+  }
+
+  function addItem() {
+    const id = idSeq;
+    bump();
+    setItems((prev) => [
+      ...prev,
+      { id, name: "", qty: 1, size: "", unit: activeKind === "mass" ? "kg" : "L", price: "" },
+    ]);
+  }
+
+  function resetAll() {
+    setItems([]);
+  }
+
+  // Keyboard shortcuts: Ctrl/Cmd+Enter adds a row; Esc clears all (with confirm)
+  useEffect(() => {
+    function onKey(e) {
+      const tag = (e.target?.tagName || '').toUpperCase();
+      const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+      if ((e.key === 'Enter' && (e.ctrlKey || e.metaKey)) || (e.key === 'Enter' && !isTyping)) {
+        e.preventDefault();
+        addItem();
+      }
+      if (e.key === 'Escape') {
+        if (window.confirm('Clear all rows?')) resetAll();
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-white text-gray-900">
+      {/* Header */}
+      <header className="sticky top-0 z-10 border-b bg-white/80 backdrop-blur">
+        <div className="mx-auto max-w-5xl px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="h-9 w-9 rounded-full border flex items-center justify-center">
+              <span className="text-xl">✓</span>
+            </div>
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight">TrueCostChecker</h1>
+              <p className="text-xs text-gray-500">See the real deal behind the price tag.</p>
+            </div>
+          </div>
+
+          </div>
+      </header>
+
+      {/* Hero */}
+      <section className="mx-auto max-w-5xl px-4 pt-10 pb-6">
+        <div className="grid gap-6 md:grid-cols-5 md:items-center">
+          <div className="md:col-span-3">
+            <h2 className="text-3xl md:text-4xl font-bold leading-tight">Never overpay for groceries again</h2>
+            <p className="mt-3 text-gray-600">Enter the size and price of the products you're comparing — we calculate the true cost so you can choose the best deal confidently.</p>
+            <ul className="mt-4 text-sm text-gray-700 list-disc pl-5 space-y-1">
+              <li>Automatic unit conversions (kg/g/oz/lb · L/mL/fl oz)</li>
+              <li>Supports multi-packs (e.g., 6 × 946 mL)</li>
+              <li>Highlights the lowest cost per unit</li>
+              <li>Mobile-friendly for in-store use</li>
+            </ul>
+          </div>
+          <div className="md:col-span-2">
+            <div className="rounded-2xl border p-4 shadow-sm bg-gradient-to-br from-emerald-50 to-white">
+              <p className="text-sm text-gray-700">
+                <span className="font-semibold">Tip:</span> Enter two or more items to compare and we'll show the <span className="font-medium text-emerald-700">Best Value</span>.
+              </p>
+              <p className="mt-2 text-xs text-gray-500">Mass items display $/kg. Volume items display $/L.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Ad (smart placement below hero) */}
+      <AdSmartBlock />
+
+      {/* Compare Tool */}
+      <section id="compare" className="mx-auto max-w-5xl px-4 pb-16">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="inline-flex items-center gap-2">
+            <div className="inline-flex rounded-lg border p-1 bg-white">
+              {["mass", "volume"].map((kind) => (
+                <button
+                  key={kind}
+                  className={classNames(
+                    "px-3 py-1.5 text-sm rounded-md",
+                    activeKind === kind ? "bg-emerald-600 text-white" : "hover:bg-gray-50"
+                  )}
+                  onClick={() => setActiveKind(kind)}
+                  aria-pressed={activeKind === (kind)}
+                >
+                  {kind === "mass" ? "Mass (kg/g/oz/lb)" : "Volume (L/mL/fl oz)"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Right-side actions (desktop) */}
+          <div className="hidden md:flex items-center gap-2">
+            <button
+              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+              onClick={addItem}
+            >
+              + Add Item
+            </button>
+            <button
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+              onClick={resetAll}
+            >
+              Reset
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto rounded-2xl border shadow-sm">
+          <table className="w-full min-w-[820px] text-left">
+            <thead className="bg-white/90 backdrop-blur sticky top-0 z-10 text-gray-600 text-sm border-b">
+              <tr>
+                <th className="px-4 py-3 font-medium">Product</th>
+                <th className="px-4 py-3 font-medium">Qty</th>
+                <th className="px-4 py-3 font-medium">Size (each)</th>
+                <th className="px-4 py-3 font-medium">Unit</th>
+                <th className="px-4 py-3 font-medium">Price</th>
+                <th className="px-4 py-3 font-medium">Unit Price ({displayCfg.suffix})</th>
+                <th className="px-4 py-3 font-medium">Best</th>
+                <th className="px-4 py-3 font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((row) => {
+                const unitMeta = UNITS[row.unit];
+                const showKind = unitMeta?.kind || commonKind || activeKind;
+                const showCfg = BASE_DISPLAY[showKind];
+                const unitPriceDisplay = isFinite(row.perDisplay)
+                  ? formatPerUnit(row.perDisplay)
+                  : "—";
+                const qty = Number(row.qty) || 1;
+                const totalBase = unitMeta ? unitMeta.toBase(Number(row.size) || 0) * qty : 0;
+                const totalDisplayQty = totalBase * showCfg.factorToShow; // g→kg or mL→L
+                return (
+                  <tr
+                    key={row.id}
+                    className={classNames(
+                      "border-t",
+                      row.isBest ? "bg-emerald-50/60" : "bg-white"
+                    )}
+                  >
+                    <td className="px-4 py-3 align-top">
+                      <input
+                        className="w-full rounded-md border px-3 py-2 text-sm"
+                        placeholder="e.g., Almond Milk – Store A"
+                        value={row.name}
+                        onChange={(e) => updateItem(row.id, { name: e.target.value })}
+                      />
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-20">
+                      <input
+                        className="w-full rounded-md border px-3 py-2 text-sm"
+                        type="number"
+                        min="1"
+                        step="1"
+                        placeholder="1"
+                        value={row.qty ?? 1}
+                        onChange={(e) => updateItem(row.id, { qty: e.target.value })}
+                      />
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-32">
+                      <input
+                        className="w-full rounded-md border px-3 py-2 text-sm"
+                        type="number"
+                        min="0"
+                        step="any"
+                        placeholder="Size"
+                        value={row.size}
+                        onChange={(e) => updateItem(row.id, { size: e.target.value })}
+                      />
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-36">
+                      <select
+                        className="w-full rounded-md border px-3 py-2 text-sm bg-white"
+                        value={row.unit}
+                        onChange={(e) => updateItem(row.id, { unit: e.target.value })}
+                      >
+                        {(activeKind === "mass"
+                          ? ["kg", "g", "lb", "oz"]
+                          : ["L", "mL", "floz"]
+                        ).map((u) => (
+                          <option key={u} value={u}>
+                            {UNITS[u].label}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-36">
+                      <div className="flex items-center gap-2">
+                        <span className="text-gray-500">$</span>
+                        <input
+                          className="w-full rounded-md border px-3 py-2 text-sm"
+                          type="number"
+                          min="0"
+                          step="any"
+                          placeholder="0.00"
+                          value={row.price}
+                          onChange={(e) => updateItem(row.id, { price: e.target.value })}
+                        />
+                      </div>
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-48">
+                      <div className="text-sm">
+                        {isFinite(row.perDisplay) ? (
+                          <>
+                            <span className="tabular-nums font-medium">${unitPriceDisplay} {showCfg.suffix}</span>
+                            {isFinite(totalDisplayQty) && totalDisplayQty > 0 && (
+                              <div className="text-xs text-gray-500">Total: {totalDisplayQty.toFixed(2)} {showCfg.show}</div>
+                            )}
+                          </>
+                        ) : (
+                          <span className="text-gray-400">—</span>
+                        )}
+                        {row.savingsPct != null && !row.isBest && isFinite(row.savingsPct) && (
+                          <div className="text-xs text-gray-500">Save {Math.abs(row.savingsPct).toFixed(1)}% if you pick the best</div>
+                        )}
+                      </div>
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-28">
+                      {row.isBest ? (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                          Best Value
+                        </span>
+                      ) : (
+                        <span className="text-xs text-gray-400">—</span>
+                      )}
+                    </td>
+
+                    <td className="px-4 py-3 align-top w-40">
+                      <div className="flex items-center gap-2">
+                        <button
+                          className="rounded-md border px-3 py-1.5 text-sm hover:bg-gray-50"
+                          onClick={() => setItems((prev)=>{ const item = prev.find(p=>p.id===row.id); if(!item) return prev; const id = Math.max(0,...prev.map(p=>p.id))+1; return [...prev, { ...item, id, name: (item.name||'') + ' (copy)'}]; })}
+                        >
+                          Duplicate
+                        </button>
+                        <button
+                          className="rounded-md border px-3 py-1.5 text-sm hover:bg-gray-50"
+                          onClick={() => removeItem(row.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+
+              {sorted.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="px-4 py-10 text-center text-gray-500">
+                    No items yet. Click <span className="font-medium">Add Item</span> to start comparing.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* In-content ad below comparison table */}
+        <div className="mt-6">
+          <AdSlot id="in-content" label="In-Content" />
+        </div>
+
+        {/* Helper note for mixed kinds */}
+        {computed.some((r) => r.kind !== computed[0]?.kind) && (
+          <p className="mt-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-md p-3">
+            Heads up: You're comparing a mix of mass and volume items. Unit prices are still computed, but the "Best Value" badge only compares items of the same type.
+          </p>
+        )}
+
+        {/* Footer actions */}
+        <div className="mt-6 flex flex-wrap items-center gap-3">
+          <button
+            className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50"
+            onClick={addItem}
+          >
+            + Add another item
+          </button>
+          <button
+            className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50"
+            onClick={() => setSortMode('asc')}
+          >
+            Sort by lowest
+          </button>
+          <button
+            className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50"
+            onClick={() => setSortMode('desc')}
+          >
+            Sort by highest
+          </button>
+          <button
+            className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50"
+            onClick={() => setSortMode('none')}
+          >
+            Clear sort
+          </button>
+          <button
+            className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+            onClick={resetAll}
+          >
+            Reset
+          </button>
+        </div>
+      </section>
+
+      {/* Mobile floating action bar */}
+      <div className="fixed inset-x-0 bottom-0 z-20 md:hidden border-t bg-white/95 backdrop-blur px-4 py-3">
+        <div className="mx-auto max-w-5xl flex items-center justify-between gap-3">
+          <button
+            className="flex-1 rounded-lg bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-700"
+            onClick={addItem}
+          >
+            <span className="inline">＋</span>
+            <span className="sr-only">Add Item</span>
+          </button>
+          <button
+            className="rounded-lg bg-red-600 px-4 py-3 text-sm font-medium text-white hover:bg-red-700"
+            onClick={resetAll}
+          >
+            Reset
+          </button>
+        </div>
+      </div>
+
+      <footer className="border-t py-10 text-center text-xs text-gray-500">
+        © {new Date().getFullYear()} TrueCostChecker — Price transparency for smart shoppers.
+      </footer>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+  </script>
+</body>
+</html>
